@@ -1,0 +1,208 @@
+#include <Arduino.h>
+#include <Preferences.h>
+
+Preferences prefs;
+
+// ===== PIN CONFIG =====
+#define M1_RPWM 4
+#define M1_LPWM 5
+#define M1_CS   16
+#define M1_HALL 18
+
+#define M2_RPWM 6
+#define M2_LPWM 7
+#define M2_CS   17
+#define M2_HALL 19
+
+#define PHOTO_EYE 21
+#define LOOP_IN   22
+
+// ===== STATE =====
+enum GateState {STOPPED, OPENING, CLOSING, REVERSING};
+GateState state = STOPPED;
+
+// ===== POSITION =====
+volatile long g1_pos = 0;
+volatile long g2_pos = 0;
+
+long g1_open = 1000;
+long g1_close = 0;
+long g2_open = 1000;
+long g2_close = 0;
+
+// ===== CURRENT =====
+int currentLimit = 2000;
+
+// ===== TIMING =====
+unsigned long reverseTimer = 0;
+
+// ===== INTERRUPTS =====
+void IRAM_ATTR hall1(){ g1_pos++; }
+void IRAM_ATTR hall2(){ g2_pos++; }
+
+// ===== MOTOR CONTROL =====
+void setMotor(int ch_fwd, int ch_rev, int dir, int speed)
+{
+    if(dir == 1){ ledcWrite(ch_fwd, speed); ledcWrite(ch_rev, 0); }
+    else if(dir == -1){ ledcWrite(ch_fwd, 0); ledcWrite(ch_rev, speed); }
+    else { ledcWrite(ch_fwd, 0); ledcWrite(ch_rev, 0); }
+}
+
+void stopAll()
+{
+    setMotor(0,1,0,0);
+    setMotor(2,3,0,0);
+    state = STOPPED;
+}
+
+void openAll(){ state = OPENING; }
+void closeAll(){ state = CLOSING; }
+
+void reverseAll()
+{
+    state = REVERSING;
+    reverseTimer = millis();
+}
+
+// ===== TELEMETRY =====
+void sendTelemetry()
+{
+    static unsigned long last = 0;
+    if(millis() - last < 200) return;
+    last = millis();
+
+    int c1 = analogRead(M1_CS);
+    int c2 = analogRead(M2_CS);
+
+    int g1_pct = map(g1_pos, g1_close, g1_open, 0, 100);
+    int g2_pct = map(g2_pos, g2_close, g2_open, 0, 100);
+
+    Serial1.printf("STAT:%d,%d,%d,%d,%d\n",
+        state, g1_pct, g2_pct, c1, c2);
+}
+
+void sendFault(const char *msg)
+{
+    Serial1.print("FAULT:");
+    Serial1.println(msg);
+}
+
+// ===== SAFETY =====
+void checkSafety()
+{
+    int c1 = analogRead(M1_CS);
+    int c2 = analogRead(M2_CS);
+
+    if(c1 > currentLimit || c2 > currentLimit)
+    {
+        reverseAll();
+        sendFault("OVERCURRENT");
+    }
+
+    if(digitalRead(PHOTO_EYE) == LOW)
+    {
+        reverseAll();
+        sendFault("PHOTO_EYE");
+    }
+}
+
+// ===== LIMITS =====
+void checkLimits()
+{
+    if(state == OPENING)
+    {
+        if(g1_pos >= g1_open && g2_pos >= g2_open)
+            stopAll();
+    }
+    if(state == CLOSING)
+    {
+        if(g1_pos <= g1_close && g2_pos <= g2_close)
+            stopAll();
+    }
+}
+
+// ===== MOTOR UPDATE =====
+void updateMotors()
+{
+    int speed = 200;
+
+    if(state == OPENING)
+    {
+        setMotor(0,1,1,speed);
+        setMotor(2,3,1,speed);
+    }
+    else if(state == CLOSING)
+    {
+        setMotor(0,1,-1,speed);
+        setMotor(2,3,-1,speed);
+    }
+    else if(state == REVERSING)
+    {
+        setMotor(0,1,1,speed);
+        setMotor(2,3,1,speed);
+
+        if(millis() - reverseTimer > 2000)
+            stopAll();
+    }
+    else stopAll();
+}
+
+// ===== COMMANDS =====
+void handleCommand(String cmd)
+{
+    cmd.trim();
+
+    if(cmd == "OPEN") openAll();
+    else if(cmd == "CLOSE") closeAll();
+    else if(cmd == "STOP") stopAll();
+
+    else if(cmd == "SET_G1_OPEN"){ g1_open = g1_pos; prefs.putLong("g1o", g1_open); }
+    else if(cmd == "SET_G1_CLOSE"){ g1_close = g1_pos; prefs.putLong("g1c", g1_close); }
+
+    else if(cmd == "SET_G2_OPEN"){ g2_open = g2_pos; prefs.putLong("g2o", g2_open); }
+    else if(cmd == "SET_G2_CLOSE"){ g2_close = g2_pos; prefs.putLong("g2c", g2_close); }
+}
+
+// ===== SETUP =====
+void setup()
+{
+    Serial.begin(115200);
+    Serial1.begin(115200);
+
+    pinMode(PHOTO_EYE, INPUT_PULLUP);
+
+    attachInterrupt(M1_HALL, hall1, RISING);
+    attachInterrupt(M2_HALL, hall2, RISING);
+
+    ledcSetup(0,20000,8);
+    ledcSetup(1,20000,8);
+    ledcSetup(2,20000,8);
+    ledcSetup(3,20000,8);
+
+    ledcAttachPin(M1_RPWM,0);
+    ledcAttachPin(M1_LPWM,1);
+    ledcAttachPin(M2_RPWM,2);
+    ledcAttachPin(M2_LPWM,3);
+
+    prefs.begin("gate", false);
+
+    g1_open = prefs.getLong("g1o",1000);
+    g1_close = prefs.getLong("g1c",0);
+    g2_open = prefs.getLong("g2o",1000);
+    g2_close = prefs.getLong("g2c",0);
+}
+
+// ===== LOOP =====
+void loop()
+{
+    if(Serial1.available())
+    {
+        String cmd = Serial1.readStringUntil('\n');
+        handleCommand(cmd);
+    }
+
+    checkSafety();
+    checkLimits();
+    updateMotors();
+    sendTelemetry();
+}
